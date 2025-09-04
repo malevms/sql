@@ -285,4 +285,74 @@ COMBINED_TERM_CHRG AS (
     LEFT JOIN (
         SELECT *
         FROM D_IDW_IBV.ENCTR
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY src_admn_enctr_sk,
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY src_admn_enctr_sk,src_admn_name_space_cd ORDER BY load_mod_dt_tm DESC, load_add_dt_tm DESC) = 1
+    ) e ON (e.enctr_id = eh.enctr_id AND eh.name_space_cd = e.src_admn_name_space_cd)
+    LEFT JOIN D_IDW_IBV.PRTY_INDIV_NAME pin ON (pin.INDIV_PRTY_ID = e.PTIENT_MBR_PRTY_ID AND pin.NAME_TYPE_CD = 'GVN_NM')
+    LEFT JOIN D_ERM_IBV.enctr_tsactn_dtl td ON (eh.name_space_cd = td.name_space_cd AND eh.enctr_id = td.enctr_id)
+    LEFT JOIN D_SHR_IBV.term_map_grp_fltn chrgCdTerm ON (dtl.item_chrg_cd = chrgCdTerm.src_term_key AND chrgCdTerm.tgt_fmly_name = 'ChargeCdGroup' AND me_dt.new_eff_from_dt BETWEEN chrgCdTerm.eff_strt_dt AND chrgCdTerm.eff_end_dt)
+    LEFT JOIN D_SHR_IBV.term_map_grp_fltn chrgDeptTerm ON (dtl.RVNU_DEPT_CD = chrgDeptTerm.src_term_key AND chrgDeptTerm.tgt_fmly_name = 'ChargeDepartmentGroup' AND me_dt.new_eff_from_dt BETWEEN chrgDeptTerm.eff_strt_dt AND chrgDeptTerm.eff_end_dt)
+    LEFT JOIN D_SHR_IBV.term_map_grp_fltn revLocTerm ON (dtl.RVNU_LOC_CD = revLocTerm.src_term_key AND revLocTerm.tgt_fmly_name = 'ChargeDepartmentGroup' AND me_dt.new_eff_from_dt BETWEEN revLocTerm.eff_strt_dt AND revLocTerm.eff_end_dt)
+    LEFT JOIN D_SHR_IBV.term_map_fltn td1 ON (dtl.cpt_hcpc_std_pcdr_cd = td1.src_term_key)
+    LEFT JOIN D_SHR_IBV.term_map_grp_fltn tg11 ON (td1.tgt_term_key = tg11.src_term_key AND tg11.tgt_fmly_name = 'ServiceLineDRG' AND me_dt.new_eff_from_dt BETWEEN tg11.eff_strt_dt AND tg11.eff_end_dt)
+    LEFT JOIN D_SHR_IBV.term_map_grp grp ON (td.item_tsactn_cd = grp.src_term_key)
+    WHERE eh.name_space_cd = :in_name_space_cd
+    AND EXISTS (
+        SELECT 1
+        FROM D_ERM_IBV.enctr_prcs_cntrl prcs_ctrl
+        WHERE prcs_ctrl.enctr_id = eh.enctr_id
+        AND prcs_ctrl.name_space_cd = eh.name_space_cd
+        AND (
+            prcs_ctrl.std_grpg_rsult_dt IS NULL
+            OR prcs_ctrl.std_grpg_rsult_dt < prcs_ctrl.std_grpg_extc_dt
+            OR (:in_run_type IN ('H','S') AND COALESCE(prcs_ctrl.std_grpg_rsult_dt, DATE'2041-01-01') >= :l_start_dt)
+        )
+    )
+    GROUP BY eh.enctr_id, eh.name_space_cd, me_dt.new_eff_from_dt
+),
+MAIN AS (
+    SELECT
+        enctr_hist.enctr_id,
+        me_dt.new_eff_from_dt eff_from_dt,
+        DATE'2041-01-01' eff_thru_dt,
+        enctr_hist.REC_AUTH,
+        enctr_hist.NAME_SPACE_CD,
+        CASE WHEN COALESCE(COMBINED_TERM_CHRG.SurgeryCharge_cnt, 0) > 0 THEN 'Y' ELSE 'N' END surg_flg,
+        CASE WHEN COALESCE(COMBINED_TERM_CHRG.EmergencyCharge_cnt, 0) > 0 THEN 'Y' ELSE 'N' END er_flg,
+        CASE
+            WHEN COMBINED_TERM_CHRG.term_all_cnt > 0 THEN COMBINED_TERM_CHRG.v_grp_cd_all
+            ELSE 'Undefined Others'
+        END v_grp_cd,
+        COMBINED_TERM_CHRG.inptn_covid_flg
+    FROM D_ERM_IBV.ENCTR_HIST enctr_hist
+    JOIN me_dt ON (me_dt.new_eff_from_dt BETWEEN enctr_hist.eff_from_dt AND enctr_hist.eff_thru_dt)
+    LEFT JOIN COMBINED_TERM_CHRG ON (enctr_hist.enctr_id = COMBINED_TERM_CHRG.enctr_id AND enctr_hist.name_space_cd = COMBINED_TERM_CHRG.name_space_cd AND COMBINED_TERM_CHRG.eff_from_dt = me_dt.new_eff_from_dt)
+    WHERE enctr_hist.name_space_cd = :in_name_space_cd
+    AND EXISTS (
+        SELECT 1
+        FROM D_ERM_IBV.enctr_prcs_cntrl prcs_ctrl
+        WHERE prcs_ctrl.enctr_id = enctr_hist.enctr_id
+        AND prcs_ctrl.name_space_cd = enctr_hist.name_space_cd
+        AND (
+            prcs_ctrl.std_grpg_rsult_dt IS NULL
+            OR prcs_ctrl.std_grpg_rsult_dt < prcs_ctrl.std_grpg_extc_dt
+            OR (:in_run_type IN ('H','S') AND COALESCE(prcs_ctrl.std_grpg_rsult_dt, DATE'2041-01-01') >= :l_start_dt)
+        )
+    )
+)
+SELECT
+    ENCTR_ID,
+    eff_from_dt,
+    REC_AUTH,
+    NAME_SPACE_CD,
+    SURG_FLG,
+    ER_FLG,
+    :l_job_id AS JOB_ID,
+    CURRENT_DATE AS LOAD_ADD_DT_TM,
+    CURRENT_DATE AS LOAD_MOD_DT_TM,
+    '2041-01-01' AS EFF_THRU_DT,
+    COALESCE(v_grp_cd, 'Undefined Main') AS STD_PTIENT_CLAS,
+    COALESCE(inptn_covid_flg, 'N') AS INPTN_COVID_FLG
+FROM MAIN
+WHERE ENCTR_ID > 0
+GROUP BY ENCTR_ID, eff_from_dt, REC_AUTH, NAME_SPACE_CD, SURG_FLG, ER_FLG, v_grp_cd, inptn_covid_flg
+;
