@@ -1,6 +1,6 @@
--- ------------------------------------------------------------
+-- =============================================================
 -- 1. Base request data
--- ------------------------------------------------------------
+-- =============================================================
 WITH req AS (
   SELECT
     hr.id,
@@ -14,34 +14,34 @@ WITH req AS (
     hr.site_id
   FROM public.http_requests hr
   WHERE hr.completed_at IS NOT NULL
-    AND hr.action = 'show'          -- dashboard rendering
+    AND hr.action = 'show'
 ),
 
--- ------------------------------------------------------------
--- 2. Guess view_id from vizql_session (scalar, no set-returning)
--- ------------------------------------------------------------
+-- =============================================================
+-- 2. Extract numeric ID from vizql_session using LATERAL
+-- =============================================================
 guessed AS (
   SELECT
     r.*,
-    CASE
-      WHEN r.vizql_session ~ '^\d+$' THEN r.vizql_session::bigint
-      WHEN r.vizql_session ~ '\d+'   THEN (regexp_matches(r.vizql_session, '\d+'))[1]::bigint
-      ELSE NULL
-    END AS guessed_view_id
+    COALESCE(extracted.view_id, r.vizql_session::bigint) AS guessed_view_id
   FROM req r
+  LEFT JOIN LATERAL (
+    SELECT (regexp_matches(r.vizql_session, '\d+'))[1]::bigint AS view_id
+    WHERE r.vizql_session ~ '\d+'
+  ) extracted ON TRUE
 ),
 
--- ------------------------------------------------------------
+-- =============================================================
 -- 3. Users
--- ------------------------------------------------------------
+-- =============================================================
 usr AS (
   SELECT id, name AS user_name
   FROM public._users
 ),
 
--- ------------------------------------------------------------
--- 4. Workbooks + site (for URL)
--- ------------------------------------------------------------
+-- =============================================================
+-- 4. Workbooks + site
+-- =============================================================
 wb AS (
   SELECT
     w.id               AS workbook_id,
@@ -52,9 +52,9 @@ wb AS (
   LEFT JOIN public._sites s ON w.site_id = s.id
 ),
 
--- ------------------------------------------------------------
+-- =============================================================
 -- 5. Views (dashboards)
--- ------------------------------------------------------------
+-- =============================================================
 vw AS (
   SELECT
     v.id               AS view_id,
@@ -63,9 +63,9 @@ vw AS (
   FROM public._views v
 ),
 
--- ------------------------------------------------------------
--- 6. Join everything (guessed_view_id is now a plain column)
--- ------------------------------------------------------------
+-- =============================================================
+-- 6. Final join (guessed_view_id is now scalar)
+-- =============================================================
 matched AS (
   SELECT
     g.*,
@@ -77,13 +77,13 @@ matched AS (
     COALESCE(vw.view_name, g.az_currentsheet, 'unknown') AS dashboard_name
   FROM guessed g
   LEFT JOIN usr u  ON g.user_id = u.id
-  LEFT JOIN vw   vw ON vw.view_id = g.guessed_view_id          -- scalar join
+  LEFT JOIN vw   vw ON vw.view_id = g.guessed_view_id
   LEFT JOIN wb   wb ON wb.workbook_id = COALESCE(vw.workbook_id, g.guessed_view_id)
 )
 
--- ------------------------------------------------------------
+-- =============================================================
 -- 7. Final output
--- ------------------------------------------------------------
+-- =============================================================
 SELECT
   m.id,
   m.created_at,
@@ -94,9 +94,10 @@ SELECT
   m.workbook_url,
   m.site_name,
 
+  -- Absolute URL (replace YOUR_TABLEAU_SERVER.com)
   CONCAT(
     'https://YOUR_TABLEAU_SERVER.com',
-    CASE WHEN m.site_name IS NOT NULL THEN '/#/site/'||m.site_name ELSE '' END,
+    CASE WHEN m.site_name IS NOT NULL AND m.site_name != 'default' THEN '/#/site/'||m.site_name ELSE '' END,
     COALESCE(m.workbook_url, '')
   ) AS absolute_url,
 
