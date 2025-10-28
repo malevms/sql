@@ -1,5 +1,5 @@
 -- ------------------------------------------------------------
--- 1. Base request data (runtime = completed_at - created_at)
+-- 1. Base request data
 -- ------------------------------------------------------------
 WITH req AS (
   SELECT
@@ -14,11 +14,25 @@ WITH req AS (
     hr.site_id
   FROM public.http_requests hr
   WHERE hr.completed_at IS NOT NULL
-    AND hr.action = 'show'          -- <-- focus on dashboard rendering
+    AND hr.action = 'show'          -- dashboard rendering
 ),
 
 -- ------------------------------------------------------------
--- 2. User name
+-- 2. Guess view_id from vizql_session (scalar, no set-returning)
+-- ------------------------------------------------------------
+guessed AS (
+  SELECT
+    r.*,
+    CASE
+      WHEN r.vizql_session ~ '^\d+$' THEN r.vizql_session::bigint
+      WHEN r.vizql_session ~ '\d+'   THEN (regexp_matches(r.vizql_session, '\d+'))[1]::bigint
+      ELSE NULL
+    END AS guessed_view_id
+  FROM req r
+),
+
+-- ------------------------------------------------------------
+-- 3. Users
 -- ------------------------------------------------------------
 usr AS (
   SELECT id, name AS user_name
@@ -26,7 +40,7 @@ usr AS (
 ),
 
 -- ------------------------------------------------------------
--- 3. Workbook + site (for URL building)
+-- 4. Workbooks + site (for URL)
 -- ------------------------------------------------------------
 wb AS (
   SELECT
@@ -39,7 +53,7 @@ wb AS (
 ),
 
 -- ------------------------------------------------------------
--- 4. Views (dashboards)
+-- 5. Views (dashboards)
 -- ------------------------------------------------------------
 vw AS (
   SELECT
@@ -50,43 +64,25 @@ vw AS (
 ),
 
 -- ------------------------------------------------------------
--- 5. Match request → dashboard
---    • Try to pull a numeric view_id from vizql_session
---    • If that fails, fall back to az_currentsheet
+-- 6. Join everything (guessed_view_id is now a plain column)
 -- ------------------------------------------------------------
 matched AS (
   SELECT
-    r.*,
+    g.*,
     COALESCE(u.user_name, 'unknown')                     AS user_name,
-
-    /* ---------- guess view_id from vizql_session ---------- */
-    CASE
-      WHEN r.vizql_session ~ '^\d+$'                     THEN r.vizql_session::bigint   -- exact number
-      WHEN r.vizql_session ~ '\d+'                       THEN (regexp_matches(r.vizql_session, '\d+'))[1]::bigint
-      ELSE NULL
-    END                                                  AS guessed_view_id,
-
-    /* ---------- join to real view / workbook ---------- */
     vw.view_name,
     wb.workbook_name,
     wb.workbook_url,
     wb.site_name,
-
-    /* ---------- fallback dashboard name ---------- */
-    COALESCE(vw.view_name, r.az_currentsheet, 'unknown') AS dashboard_name
-  FROM req r
-  LEFT JOIN usr u  ON r.user_id = u.id
-  LEFT JOIN vw   vw ON vw.view_id = 
-         CASE
-           WHEN r.vizql_session ~ '^\d+$' THEN r.vizql_session::bigint
-           WHEN r.vizql_session ~ '\d+'   THEN (regexp_matches(r.vizql_session, '\d+'))[1]::bigint
-           ELSE NULL
-         END
-  LEFT JOIN wb   wb ON COALESCE(vw.workbook_id, r.guessed_view_id) = wb.workbook_id
+    COALESCE(vw.view_name, g.az_currentsheet, 'unknown') AS dashboard_name
+  FROM guessed g
+  LEFT JOIN usr u  ON g.user_id = u.id
+  LEFT JOIN vw   vw ON vw.view_id = g.guessed_view_id          -- scalar join
+  LEFT JOIN wb   wb ON wb.workbook_id = COALESCE(vw.workbook_id, g.guessed_view_id)
 )
 
 -- ------------------------------------------------------------
--- 6. Final output (one row per request)
+-- 7. Final output
 -- ------------------------------------------------------------
 SELECT
   m.id,
@@ -98,7 +94,6 @@ SELECT
   m.workbook_url,
   m.site_name,
 
-  /* ---- absolute URL (replace YOUR_TABLEAU_SERVER.com) ---- */
   CONCAT(
     'https://YOUR_TABLEAU_SERVER.com',
     CASE WHEN m.site_name IS NOT NULL THEN '/#/site/'||m.site_name ELSE '' END,
@@ -106,7 +101,7 @@ SELECT
   ) AS absolute_url,
 
   m.vizql_session,
-  m.guessed_view_id          -- <-- now **available** here
+  m.guessed_view_id
 FROM matched m
 WHERE m.runtime_sec IS NOT NULL
 ORDER BY m.created_at DESC;
