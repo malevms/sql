@@ -1,60 +1,52 @@
 -- =============================================================
--- ULTIMATE VERSION: Live vs Extract + Schedule + Last Refresh
--- Links via item_id/task_id (no direct workbook_id/schedule_id)
+-- FALLBACK VERSION: Live vs Extract + Schedule (Name Matching)
+-- Uses title/subtitle/job_type in background_jobs (no IDs needed)
 -- =============================================================
 WITH extract_jobs AS (
-  -- All extract jobs with workbook link (via item_id)
+  -- All extract jobs for workbooks (name-based)
   SELECT DISTINCT
-    bj.item_id AS workbook_id,  -- Links to _workbooks.id
-    bj.job_type,
-    bj.job_status,
-    bj.completed_at,
-    t.schedule_id  -- Via tasks table
+    REPLACE(REPLACE(bj.title, '-', ''), ' ', '') AS clean_workbook_name,  -- Normalize for matching
+    bj.title AS raw_workbook_name,
+    MAX(CASE WHEN bj.finish_code = 1 THEN bj.completed_at END) AS last_successful_refresh,  -- finish_code = 1 = success
+    STRING_AGG(DISTINCT 
+      CASE 
+        WHEN bj.job_name ~ 'schedule' OR bj.notes ~ 'schedule' THEN 
+          REGEXP_REPLACE(bj.job_name || ' ' || COALESCE(bj.notes, ''), '.*schedule[:\s]+(\w+).*', '\1')
+        ELSE NULL 
+      END, '; ') AS schedule_names  -- Parse schedule from job_name/notes
   FROM public.background_jobs bj
-  JOIN public.tasks t ON bj.task_id = t.id  -- Bridge to schedule
   WHERE bj.job_type LIKE '%Extract%'  -- Refresh Extracts, etc.
-    AND bj.subtitle = 'Workbook'  -- Ensure it's a workbook job
-),
-
-workbook_extracts AS (
-  -- Aggregate per workbook: has extract? last refresh?
-  SELECT
-    workbook_id,
-    MAX(CASE WHEN job_status = 'Success' THEN completed_at END) AS last_successful_refresh,
-    STRING_AGG(DISTINCT ej.schedule_id::text, ',') AS schedule_ids  -- Collect schedules
-  FROM extract_jobs ej
-  GROUP BY workbook_id
+    AND bj.subtitle = 'Workbook'      -- Workbook-specific
+    AND bj.finish_code = 1            -- Successful only
+  GROUP BY REPLACE(REPLACE(bj.title, '-', ''), ' ', ''), bj.title
 )
 
--- Main query
+-- Main query: Match by normalized name
 SELECT
     w.name                                          AS workbook_name,
     w.repository_url                                AS workbook_url,
 
-    -- Live vs Extract (via extract job existence)
+    -- Live vs Extract (name match on title)
     CASE
-        WHEN we.workbook_id IS NOT NULL THEN 'Extract'
+        WHEN ej.clean_workbook_name IS NOT NULL THEN 'Extract'
         ELSE 'Live / Unknown'
     END                                             AS connection_type,
 
     -- Last successful extract refresh
     COALESCE(
-        TO_CHAR(we.last_successful_refresh, 'YYYY-MM-DD HH24:MI'),
+        TO_CHAR(ej.last_successful_refresh, 'YYYY-MM-DD HH24:MI'),
         'Never'
     )                                               AS last_extract_refresh,
 
-    -- Refresh schedule (via collected schedule_ids)
+    -- Refresh schedule (parsed from jobs)
+    COALESCE(ej.schedule_names, 'No Schedule')      AS refresh_schedule_name,
     COALESCE(
-        STRING_AGG(DISTINCT s.name, '; ' ORDER BY s.name),
-        'No Schedule'
-    )                                               AS refresh_schedule_name,
-    COALESCE(
-        STRING_AGG(
-            DISTINCT s.type || ' – ' ||
-            s.interval ||
-            CASE WHEN s.interval_value > 1 THEN ' (every '||s.interval_value||')' ELSE '' END,
-            '; ' ORDER BY s.interval
-        ),
+        CASE 
+            WHEN ej.schedule_names ~ 'daily|day' THEN 'Daily'
+            WHEN ej.schedule_names ~ 'hourly|hour' THEN 'Hourly (every 1)'
+            WHEN ej.schedule_names ~ 'weekly|week' THEN 'Weekly'
+            ELSE 'Manual / None'
+        END,
         'Manual / None'
     )                                               AS refresh_frequency,
 
@@ -63,17 +55,12 @@ SELECT
 
 FROM public._workbooks w
 
--- Join for extract info
-LEFT JOIN workbook_extracts we ON w.id = we.workbook_id
-
--- Join for schedules (via collected IDs)
-LEFT JOIN public.schedules s ON s.id::text = ANY(STRING_TO_ARRAY(we.schedule_ids, ','))
+-- Name-based join
+LEFT JOIN extract_jobs ej 
+       ON REPLACE(REPLACE(w.name, '-', ''), ' ', '') = ej.clean_workbook_name
 
 -- Owner
-LEFT JOIN public._users owner ON w.owner_id = owner.id
-
-GROUP BY 
-    w.id, w.name, w.repository_url, we.last_successful_refresh,
-    we.workbook_id, owner.name  -- Group to handle multiple schedules
+LEFT JOIN public._users owner 
+       ON w.owner_id = owner.id
 
 ORDER BY w.name;
