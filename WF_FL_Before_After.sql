@@ -1,48 +1,45 @@
-WITH wb_performance AS (
+WITH recent_requests AS (
     SELECT 
+        hr.created_at,
+        EXTRACT(EPOCH FROM (hr.completed_at - hr.created_at)) * 1000 AS runtime_ms
+    FROM _http_requests hr
+    WHERE hr.created_at >= NOW() - INTERVAL '3 weeks'
+      AND hr.completed_at IS NOT NULL
+      AND hr.site_id = (SELECT id FROM _sites WHERE name = 'Default' LIMIT 1)  -- Optional: filter by site
+),
+
+wb_list AS (
+    SELECT 
+        wb.id,
         wb.name AS "Name",
         prj.name AS "Project Name",
         COALESCE(su.display_name, u.name) AS "Owner",
         wb.updated_at AS "Last Updated At",
-        DATE_TRUNC('day', hr.created_at) AS "Performance Date",
-        AVG(EXTRACT(EPOCH FROM (hr.completed_at - hr.created_at)) * 1000) AS "Avg Runtime (ms)",
-        COUNT(*) AS "Load Count"
-    FROM _http_requests hr
-    JOIN _workbooks wb ON TRUE                     -- Cannot join directly, so we aggregate broadly
+        wb.luid AS "LUID"
+    FROM _workbooks wb
     JOIN _projects prj ON wb.project_id = prj.id
     JOIN _users u ON wb.owner_id = u.id
     LEFT JOIN _system_users su ON u.system_user_id = su.id
-    WHERE hr.created_at >= NOW() - INTERVAL '3 weeks'
-      AND hr.completed_at IS NOT NULL
-    GROUP BY wb.name, prj.name, "Owner", wb.updated_at, DATE_TRUNC('day', hr.created_at)
-),
-
-before_after AS (
-    SELECT 
-        "Name",
-        "Project Name",
-        "Owner",
-        "Last Updated At",
-        AVG(CASE WHEN "Performance Date" < "Last Updated At" THEN "Avg Runtime (ms)" END) AS "Avg Before (ms)",
-        AVG(CASE WHEN "Performance Date" >= "Last Updated At" THEN "Avg Runtime (ms)" END) AS "Avg After (ms)",
-        SUM("Load Count") AS "Total Loads"
-    FROM wb_performance
-    GROUP BY "Name", "Project Name", "Owner", "Last Updated At"
+    WHERE wb.updated_at >= NOW() - INTERVAL '3 weeks'
+      AND wb.is_deleted = FALSE
 )
 
 SELECT 
     'Workbook' AS "Content Type",
-    "Name",
-    "Project Name",
-    "Owner",
-    "Last Updated At",
-    "Avg Before (ms)" / 1000 AS "Avg Runtime Before (sec)",
-    "Avg After (ms)" / 1000  AS "Avg Runtime After (sec)",
-    CASE 
-        WHEN "Avg Before (ms)" > 0 
-        THEN ROUND( ("Avg After (ms)" - "Avg Before (ms)") * 100.0 / "Avg Before (ms)" , 1) 
-    END AS "% Change",
-    "Total Loads"
-FROM before_after
-WHERE "Last Updated At" >= NOW() - INTERVAL '3 weeks'
-ORDER BY "% Change" ASC;   -- Negative = improvement
+    wl."Name",
+    wl."Project Name",
+    wl."Owner",
+    wl."Last Updated At",
+    DATE_TRUNC('day', rr.created_at) AS "Performance Date",
+    AVG(rr.runtime_ms) AS "Avg Runtime (ms)",
+    COUNT(*) AS "Load Count",
+    wl."LUID",
+    'workbook' AS "Content Type for URL"
+FROM recent_requests rr
+-- Minimal cross-reference via date window only (approximate but fast)
+CROSS JOIN wb_list wl
+WHERE rr.created_at BETWEEN wl."Last Updated At" - INTERVAL '7 days' AND wl."Last Updated At" + INTERVAL '14 days'  -- Narrow window
+GROUP BY wl."Name", wl."Project Name", wl."Owner", wl."Last Updated At", DATE_TRUNC('day', rr.created_at), wl."LUID"
+HAVING AVG(rr.runtime_ms) IS NOT NULL
+ORDER BY wl."Last Updated At" DESC, "Performance Date" DESC
+LIMIT 50000;   -- Safety limit
